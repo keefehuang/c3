@@ -916,13 +916,15 @@ def von_neumann(rho, h, dt, col=None):
 @tf.custom_gradient
 def grape_propagate(h0, hks, signals, dt, batch_size):
     """
-    Propagate signal to allow for grape gradient calculations
+    Propagate signal to allow for grape gradient calculations. Implements custom backpropagation step to reduce memory usage
     Parameters
     ----------
     h0: tf.tensor
         Drift Hamiltonian
     hks: Union[tf.tensor, List[tf.tensor]]
         List of control hamiltonians
+    signal: dict
+        Waveform of the control signal per drive line.
     dt: float
         Length of one time slice
     batch_size: int
@@ -930,6 +932,8 @@ def grape_propagate(h0, hks, signals, dt, batch_size):
 
     Returns
     -------
+        Tuple(tf.Tensor, tf.Tensor)
+            Tuple of time-discretized time-evolution operators and overall unitary
 
     """
     dts = signals.shape[0]
@@ -995,15 +999,18 @@ def grape(model: Model, gen: Generator, instr: Instruction):
 
     Parameters
     ----------
-    signal: dict
-        Waveform of the control signal per drive line.
-    gate: str
-        Identifier for one of the gates.
+    model: Model
+        Object representing the simulated model, provides physical description of system
+    gen: Generator
+        Object converting received information on chip
+    instr: Instruction
+        Object containing control signal for a line
 
     Returns
     -------
-    unitary
-        Matrix representation of the gate.
+    Dict
+        Dict containing U: Matrix representation of the gate, dUs: time-discretized time-evolution operators,
+        ts: timestep for time evolution.
     """
     signal = gen.generate_signals(instr)
     # Why do I get 0.0 if I print gen.resolution here?! FR
