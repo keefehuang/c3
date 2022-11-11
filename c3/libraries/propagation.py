@@ -4,6 +4,7 @@ import tensorflow as tf
 from typing import Dict
 from c3.model import Model
 from c3.generator.generator import Generator
+from c3.libraries.expm import matrix_exponential
 from c3.signal.gates import Instruction
 from c3.utils.tf_utils import (
     tf_kron,
@@ -14,6 +15,11 @@ from c3.utils.tf_utils import (
     commutator,
     anticommutator,
 )
+
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import math_ops
+from tensorflow import expand_dims
+
 
 unitary_provider = dict()
 state_provider = dict()
@@ -904,3 +910,122 @@ def schrodinger(psi, h, dt, col=None):
 @step_deco
 def von_neumann(rho, h, dt, col=None):
     return -1j * commutator(h, rho) * dt
+
+
+@tf.function
+@tf.custom_gradient
+def grape_propagate(h0, hks, signals, dt, batch_size):
+    """
+    Propagate signal to allow for grape gradient calculations
+    Parameters
+    ----------
+    h0: tf.tensor
+        Drift Hamiltonian
+    hks: Union[tf.tensor, List[tf.tensor]]
+        List of control hamiltonians
+    dt: float
+        Length of one time slice
+    batch_size: int
+        Number of elements in one batch
+
+    Returns
+    -------
+
+    """
+    dts = signals.shape[0]
+    batch_size = 16
+    batches = tf.cast(tf.math.ceil(dts / batch_size), dtype=tf.int32)
+    dUs_array = tf.TensorArray(tf.complex128, size=batches, dynamic_size=False, clear_after_read=True)
+    lU_array = tf.TensorArray(tf.complex128, size=batches, dynamic_size=False, clear_after_read=True)
+    i0 = tf.cast(tf.math.ceil(dts / batch_size)-1, dtype=tf.int32)
+    U0 = tf.eye(h0.shape[0], batch_shape=[1], dtype=tf.complex128)
+    
+    def exp_cond(i, *_):
+        return math_ops.greater_equal(i, 0)
+
+    def exp_body(i, dUs_array, lU_array, U):
+        result = matrix_exponential(tf_propagation_h(h0, hks, signals[i * batch_size : i * batch_size + batch_size], dt))
+        dUs_array = dUs_array.write(i, result)
+        lUs = tf.scan(lambda a, x: tf.matmul(a, x), tf.concat([result,U0], axis=0),reverse=True)
+        lU_array = lU_array.write(i, lUs[1:,:,:])
+        return i-1, dUs_array, lU_array, lUs[:1,:,:]
+
+    _, dUs_array, lU_array, U = control_flow_ops.while_loop(exp_cond, exp_body, loop_vars=[i0, dUs_array, lU_array, U0], shape_invariants=[i0.get_shape(), tf.TensorShape(None), tf.TensorShape(None), U0.get_shape()])
+
+    dUs = dUs_array.concat()
+    def grad(_, upstream_U):
+        grads = tf.TensorArray(tf.complex128, size=batches, dynamic_size=False, clear_after_read=True)
+        i0 = tf.cast(0, dtype=tf.int32)
+        U0 = tf.eye(h0.shape[0], batch_shape=[1], dtype=tf.complex128)
+        ihks = tf.scalar_mul(-0.5j*dt, hks)[:,tf.newaxis,:,:]        
+
+        def grad_cond(i, *_):
+           return math_ops.less(i, batches)
+    
+        def grad_body(i, grads):
+            lU = lU_array.read(i)
+            dUs = dUs_array.read(i)
+            rU = tf.scan(lambda a, x: tf.matmul(a, x), tf.concat([U0, dUs], axis=0))
+            grad = tf.linalg.adjoint(lU) @ upstream_U @ tf.math.conj(rU[:-1,:,:]) * tf.linalg.adjoint(ihks @ dUs + dUs @ tf.transpose(ihks, perm=[0,1,3,2]))
+            grads = grads.write(i, grad)
+            return i+1, grads
+
+        _, grads = control_flow_ops.while_loop(grad_cond, grad_body, loop_vars=[i0, grads], shape_invariants=[i0.get_shape(), tf.TensorShape(None)])
+        grads = tf.reduce_sum(grads.concat(), axis=[2,3])
+        return None, None, grads, None, None
+    return (dUs, U), grad
+
+@tf.function
+def tf_propagation_h(h0, hks, cflds_t, dt) -> tf.Tensor:
+    cflds_t = tf.cast(cflds_t, dtype=tf.complex128)
+    hks = tf.cast(hks, dtype=tf.complex128)
+    cflds = cflds_t[:, :, tf.newaxis, tf.newaxis]
+    hks = hks[:, tf.newaxis, ...]
+    h0 = h0[tf.newaxis, ...]
+    prod = tf.math.multiply(cflds, hks)
+    h = tf.math.add(h0, tf.reduce_sum(prod, axis=0))
+    return tf.scalar_mul(-1.0j*dt, h)
+
+
+@unitary_deco
+def grape(model: Model, gen: Generator, instr: Instruction):
+    """
+    Solve the equation of motion (Lindblad or Schrรถdinger) for a given control
+    signal and Hamiltonians.
+
+    Parameters
+    ----------
+    signal: dict
+        Waveform of the control signal per drive line.
+    gate: str
+        Identifier for one of the gates.
+
+    Returns
+    -------
+    unitary
+        Matrix representation of the gate.
+    """
+    signal = gen.generate_signals(instr)
+    # Why do I get 0.0 if I print gen.resolution here?! FR
+    ts = []
+    h0, hctrls = model.get_Hamiltonians()
+    signals = []
+    hks = []
+    for key in signal:
+        signals.append(signal[key]["values"])
+        ts = signal[key]["ts"]
+        hks.append(hctrls[key])
+    signals = tf.cast(signals, tf.complex128)
+    hks = tf.cast(hks, tf.complex128)
+    dt = tf.constant(ts[1].numpy() - ts[0].numpy(), dtype=tf.complex128)
+
+    batch_size = tf.constant(len(h0), tf.int32)
+    dUs, U = grape_propagate(h0, hks, signals, dt, batch_size=batch_size)
+
+
+    if model.max_excitations:
+        U = model.blowup_excitations(tf_matmul_left(tf.cast(dUs, tf.complex128)))
+        dUs = tf.vectorized_map(model.blowup_excitations, dUs)
+    
+    # return U, dUs, ts
+    return {"U": U, "dUs": dUs, "ts": ts}
